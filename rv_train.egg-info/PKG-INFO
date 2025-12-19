@@ -1,0 +1,27 @@
+Metadata-Version: 2.4
+Name: rv_train
+Version: 0.0.0
+License-File: LICENSE
+Requires-Dist: black==23.3.0
+Requires-Dist: flake8==7.1.0
+Requires-Dist: isort==5.12.0
+Requires-Dist: yacs==0.1.8
+Requires-Dist: tqdm
+Requires-Dist: tensorboardx
+Requires-Dist: einops
+Requires-Dist: pre-commit
+Requires-Dist: tbparse
+Provides-Extra: qwen
+Requires-Dist: peft; extra == "qwen"
+Requires-Dist: qwen-vl-utils; extra == "qwen"
+Requires-Dist: bitsandbytes; extra == "qwen"
+Requires-Dist: hf_xet; extra == "qwen"
+Provides-Extra: libero
+Provides-Extra: all
+Requires-Dist: peft; extra == "all"
+Requires-Dist: qwen-vl-utils; extra == "all"
+Requires-Dist: hf_xet; extra == "all"
+Requires-Dist: bitsandbytes; extra == "all"
+Dynamic: license-file
+Dynamic: provides-extra
+Dynamic: requires-dist

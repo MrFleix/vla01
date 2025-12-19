@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Conda / Virtualenv
+.env/
+venv/
+*.conda
+*.env
+
+# PyTorch / Checkpoints
+*.pt
+*.pth
+*.safetensors
+dataset_stats.pkl
+runs/
+runs/**/checkpoint-*
+
+# Embedded repositories / external libs
+libs/LIBERO/
+libs/egl_probe/
+
+# Unsloth
+unsloth_compiled_cache/

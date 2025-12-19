@@ -1,0 +1,47 @@
+EXP:
+  EXP_ID: "vla0"
+  MODEL: "unsloth"
+  LR_SCHED: "none"
+  AMP: True
+  OPTIMIZER: "adamw"
+
+TRAIN:
+  lr: 5e-6
+  num_epochs: 24
+  clip_grad_norm: 0.0
+  save_steps: 2
+  save_total_limit: 3     
+  output_dir: "./runs/vla0"  
+  per_device_train_batch_size: 8
+  gradient_accumulation_steps: 2
+  xformers: False
+
+EXP_EXTRA:
+  save_ckp: 2             
+
+DATALOADER:
+  num_workers: 16
+  ROBOVERSE:
+    cfg_path: libs/RoboVerse/roboverse/configs/img_libero_aug.yaml
+    cfg_opts: IMAGE.crop_img:0.875:IMAGE.img_size:224:IMAGE.cam_list:('3p1','3p2')
+
+#Model List
+# unsloth/Qwen2.5-VL-3B-Instruct-unsloth-bnb-4bit
+# unsloth/Qwen3-VL-8B-Instruct-unsloth-bnb-4bit
+
+
+MODEL:
+  UNSLOTH:
+    qwen_model_id: "unsloth/Qwen2.5-VL-3B-Instruct-unsloth-bnb-4bit"
+    num_cam: 2
+    rgb_img_size: 224,224
+    tiled_rgb_imgs: True
+    add_vision_id: True
+    num_bins_actions: 1000
+    action_mask_aug_per: 0.4
+    use_flash_attention_2: False
+    peft_r: 16
+    peft_alpha: 16
+    use_gradient_checkpointing:  "unsloth"
+    load_in_4bit: True
+    horizon: 8
