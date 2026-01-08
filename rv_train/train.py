@@ -1,9 +1,11 @@
 # Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Licensed under the CC BY-NC 4.0 license [see LICENSE for details].
+
+import os
+os.environ['UNSLOTH_COMPILE_DIR'] = '/tmp/unsloth_compile'
 import argparse
 import gc
-import os
 import pickle as pkl
 import pprint
 import random
@@ -14,7 +16,6 @@ from time import time
 
 import datasets.features as dsf
 from datasets import Sequence
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, distributed
 from unsloth import FastVisionModel
 from unsloth.trainer import UnslothVisionDataCollator
@@ -23,23 +24,21 @@ if not hasattr(dsf, "List"):
     dsf.List = Sequence
 import roboverse
 import torch
-import torch.distributed as dist
-import torch.multiprocessing as mp
 import tqdm
 from torch import autocast
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import lr_scheduler
 from torch.utils.data import DataLoader
 from trl import SFTConfig, SFTTrainer
 from unsloth import FastVisionModel
 from unsloth.trainer import UnslothVisionDataCollator
-
+import tempfile
 from rv_train import models
 from rv_train.configs import get_cfg_defaults
-from rv_train.models.qwen.dataset import QwenSFTDataset
+from rv_train.models.qwen.dataset import QwenSFTDataset, QwenCachedDataset
+from rv_train.models.qwen.dataset_preprocess import preprocess_qwen_dataset
 from rv_train.models.qwen.model import QwenActor
 from rv_train.utils import train_utils as utils
-
+from accelerate import Accelerator
 DEVICE = ""
 
 START_TIME = time()
@@ -49,6 +48,7 @@ import pickle as pkl
 
 from transformers import TrainerCallback
 
+os.environ["UNSLOTH_USE_FLASH_ATTENTION"] = "1"
 """
 Training script usage:
 
@@ -56,12 +56,14 @@ Training script usage:
 python -m rv_train.train \
   --exp-config ./configs/vla0.yaml \
   --resume \
-  --model-path /home/felix/vla0/runs/vla0/checkpoint-150 \
+  --model-path /workspace/runs/vla0/checkpoint-1600 \
   --devices 0
 
 # Train from scratch
 python -m rv_train.train --exp-config ./configs/vla0.yaml
 
+# Multi GPU
+accelerate launch --num_processes=4   -m rv_train.train   --exp-config ./configs/vla0.yaml   --resume   --model-path /workspace/runs/vla0/checkpoint-1600
 Notes:
 - The --resume flag allows loading either a full model or a LoRA adapter.
 - Dataset statistics are saved automatically:
@@ -80,28 +82,24 @@ class DatasetStatsCallback(TrainerCallback):
         self.log_dir = log_dir
 
     def on_save(self, args, state, control, **kwargs):
-        # nur auf Rank 0 speichern
-        if not dist.is_initialized() or dist.get_rank() == 0:
-            stats_path = os.path.join(self.log_dir, "dataset_stats.pkl")
-            with open(stats_path, "wb") as f:
-                pkl.dump(self.model.original_dataset_stats, f)
-            print(f"Dataset stats saved to {stats_path}")
-
+        try:
+            accelerator = Accelerator()
+            if not accelerator.is_main_process:
+                return
+        except:
+            pass
+            
+        stats_path = os.path.join(self.log_dir, "dataset_stats.pkl")
+        with open(stats_path, "wb") as f:
+            pkl.dump(self.model.original_dataset_stats, f)
+        print(f"Dataset stats saved to {stats_path}")
 
 def get_pretrained_model(
     model_path: str,
     device=0,
 ):
-    """
-    Baut exakt das gleiche QwenActor-Modell wie im Training
-    und lädt Checkpoint + Dataset-Stats korrekt.
-    """
-
     device = f"cuda:{device}" if isinstance(device, int) else device
 
-    # -------------------------------------------------
-    # 1️⃣ Config laden
-    # -------------------------------------------------
     model_folder = os.path.dirname(
         model_path
     )  # .../full_model/Qwen2.5-VL-3B-Instruct-unsloth-bnb-4bit
@@ -118,9 +116,6 @@ def get_pretrained_model(
 
     cfg = get_cfg(cfg_path, cfg_opts="")
 
-    # -------------------------------------------------
-    # 2️⃣ Modell bauen (Inference-Modus)
-    # -------------------------------------------------
     model = get_model(
         cfg,
         calculate_dataset_stats=False,
@@ -182,39 +177,31 @@ def get_inp(cfg, data_batch):
     inp = data_batch
     return inp
 
+def get_model(cfg, calculate_dataset_stats: bool = True, for_training: bool = True):
 
-def get_model(
-    cfg,
-    calculate_dataset_stats: bool = True,
-    for_training: bool = True,
-):
-    """
-    Returns model based on the config.
-    for_training:
-        True  -> Training (Unsloth training mode)
-        False -> Inference / Evaluation
-    """
+    model = models.QwenActor(**cfg.MODEL.UNSLOTH, for_training=for_training)
 
-    if cfg.EXP.MODEL == "unsloth":
-        model = models.QwenActor(
-            **cfg.MODEL.UNSLOTH,
-            for_training=for_training,
-        )
-    else:
-        raise AssertionError(f"Invalid model: {cfg.EXP.MODEL}")
-
-    # -------------------------------------------------
-    # Dataset stats NUR im Training berechnen
-    # -------------------------------------------------
     if calculate_dataset_stats and for_training:
-        temp_dataset = get_dataloader(
-            split="train",
-            cfg=cfg,
-            get_dataset=True,
-        )
-        model.set_dataset_stats(temp_dataset.stats)
-        del temp_dataset
+        accelerator = Accelerator()
+        stats = None
 
+        if accelerator.is_main_process:
+            print("Computing dataset stats on main process...")
+            temp_dataset = get_dataloader(split="train", cfg=cfg, get_dataset=True)
+            stats = temp_dataset.stats
+            del temp_dataset
+            temp_path = os.path.join(tempfile.gettempdir(), "dataset_stats.pkl")
+            with open(temp_path, "wb") as f:
+                pkl.dump(stats, f)
+
+        accelerator.wait_for_everyone()
+        if not accelerator.is_main_process:
+            temp_path = os.path.join(tempfile.gettempdir(), "dataset_stats.pkl")
+            with open(temp_path, "rb") as f:
+                stats = pkl.load(f)
+
+        model.set_dataset_stats(stats)
+        accelerator.wait_for_everyone()
     return model
 
 
@@ -238,17 +225,14 @@ def get_dataloader(split, cfg, get_dataset=False):
     """
     num_workers = cfg.DATALOADER.num_workers
     dataset_args = {"split": split}
-
     if cfg.EXP.DATASET == "roboverse":
         print("WARNING: split is ignored for roboverse dataset.")
         dataset_args = dict(**cfg.DATALOADER.ROBOVERSE)
         dataset = roboverse.get_unified_dataset(**dataset_args)
     else:
         raise NotImplementedError
-
     if "batch_proc" not in dir(dataset):
         dataset.batch_proc = default_batch_proc
-
     if get_dataset:
         return dataset
     else:
@@ -257,10 +241,10 @@ def get_dataloader(split, cfg, get_dataset=False):
             num_workers=num_workers,
             shuffle=(split == "train"),
             drop_last=(split == "train"),
-            pin_memory=(torch.cuda.is_available()) and (not num_workers),
+            pin_memory=True,
             persistent_workers=(num_workers > 0),
+            prefetch_factor=2 if num_workers > 0 else None,  # ← NEU: Prefetch 2 batches
         )
-
 
 def check_grad(model, loss):
     bad_grad = False
@@ -283,18 +267,11 @@ def check_grad(model, loss):
 
 def print_model_stats(model):
     """Print model statistics including parameter counts."""
-    # Get model module if using DDP
     model_module = model.module if isinstance(model, DDP) else model
-
-    # Count total parameters
     total_params = sum(p.numel() for p in model_module.parameters())
-
-    # Count trainable parameters
     trainable_params = sum(
         p.numel() for p in model_module.parameters() if p.requires_grad
     )
-
-    # Count non-trainable parameters
     non_trainable_params = total_params - trainable_params
 
     print("=" * 50)
@@ -316,65 +293,48 @@ def get_log_dir(cfg, logdir_with_time=False):
 
 
 def entry_train(
-    rank,
     cfg,
     logdir_with_time=False,
     resume=False,
     model_path="",
-    devices=[0],
-    port=12345,
 ):
-    multi_gpu = len(devices) > 1
-    device = f"cuda:{devices[rank]}" if torch.cuda.is_available() else "cpu"
+    accelerator = Accelerator()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # -------------------------
-    # Multi-GPU Setup
-    # -------------------------
-    if multi_gpu:
-        os.environ["MASTER_ADDR"] = "127.0.0.1"
-        os.environ["MASTER_PORT"] = str(port)
-        dist.init_process_group(
-            backend="nccl" if torch.cuda.is_available() else "gloo",
-            world_size=len(devices),
-            rank=rank,
-        )
 
-    if torch.cuda.is_available():
-        torch.cuda.set_device(device)
-
-    # -------------------------
-    # Log-Ordner
-    # -------------------------
     log_dir = get_log_dir(cfg, logdir_with_time)
     os.makedirs(log_dir, exist_ok=True)
 
-    # -------------------------
-    # Dataset
-    # -------------------------
+
+    model = get_model(cfg, calculate_dataset_stats=not resume, for_training=True)
+
     loader_train = get_dataloader(split="train", cfg=cfg, get_dataset=True)
-    train_dataset = models.QwenSFTDataset(
-        loader_train, None
-    )  # model wird später gesetzt
-
-    # -------------------------
-    # Model laden (Unsloth/FastVisionModel)
-    # -------------------------
-    model = get_model(cfg, calculate_dataset_stats=not resume, for_training=True).to(
-        device
-    )
-
+    precompute_dataset = True
+    if precompute_dataset: 
+        cache_file = "cache_checkpoints/cache_part_00000.pt
+        train_dataset = models.QwenCachedDataset(
+            cache_file=cache_file,
+            preprocess_fn=lambda: models.preprocess_qwen_dataset(loader_train, model, max_workers=16)
+        )
+    else:
+        train_dataset = models.QwenSFTDataset(loader_train, model)
+    
     if resume and model_path:
-        # Dataset-Stats laden
-        stats_path = os.path.join(os.path.dirname(model_path), "dataset_stats.pkl")
-        if os.path.exists(stats_path):
-            with open(stats_path, "rb") as f:
-                model.set_dataset_stats(pkl.load(f))
 
-    # Multi-GPU: DDP auf model.model (FastVisionModel)
-    if multi_gpu:
-        model.model = DDP(model.model, device_ids=[device], output_device=device)
+        run_dir = os.path.dirname(model_path)          # /home/felix/vla01/runs/vla0/checkpoint-1600 -> checkpoint-1600
+        stats_path = os.path.join(run_dir, "dataset_stats.pkl")
+    
+        print("model_path :", model_path)
+        print("stats_path :", stats_path)
+        print("exists    :", os.path.exists(stats_path))
+    
+        if not os.path.exists(stats_path):
+            raise RuntimeError(f"dataset_stats.pkl NOT FOUND!\nExpected at: {stats_path}")
+    
+        with open(stats_path, "rb") as f:
+            model.set_dataset_stats(pkl.load(f))
 
-    # Model im Dataset Wrapper setzen
+
     train_dataset.model = model
 
     # -------------------------
@@ -413,70 +373,42 @@ def entry_train(
             max_length=cfg.TRAIN.max_length,
             save_steps=cfg.TRAIN.save_steps,
             save_total_limit=cfg.TRAIN.save_total_limit,
+            ddp_find_unused_parameters=False,
+            gradient_checkpointing="selective",
+            gradient_checkpointing_kwargs={"use_reentrant": False},
         ),
     )
     trainer.add_callback(stats_callback)
-
-    # -------------------------
-    # Training starten
-    # -------------------------
-    trainer.train(resume_from_checkpoint=resume and bool(model_path))
-
-    # -------------------------
-    # Speichern nur auf Rank 0
-    # -------------------------
-    if not multi_gpu or (multi_gpu and dist.get_rank() == 0):
-        trainer.save_model()
+    
+    trainer.train(resume_from_checkpoint=model_path if resume else None)
+    trainer.save_model()
+    
+    if accelerator.is_main_process:
         stats_path = os.path.join(log_dir, "dataset_stats.pkl")
         with open(stats_path, "wb") as f:
             pkl.dump(train_dataset.stats, f)
-        print(f"Dataset stats saved to {stats_path}")
+        print(f"Saved dataset stats to {stats_path}")
 
-    # Multi-GPU: Process Group zerstören
-    if multi_gpu:
-        dist.destroy_process_group()
-
-
-# -------------------------
-# Main
-# -------------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--entry", type=str, default="train")
     parser.add_argument("--exp-config", type=str, default="")
     parser.add_argument("--exp-cfg-opts", type=str, default="")
     parser.add_argument("--model-path", type=str, default="")
-    parser.add_argument("--logdir-with-time", action="store_true", default=False)
+    parser.add_argument("--logdir-with-time", action="store_true", default=True)
     parser.add_argument("--resume", action="store_true", default=False)
-    parser.add_argument("--devices", type=str, default="0")
 
     cmd_args = parser.parse_args()
 
     # from rv_train.configs import get_cfg
 
     _cfg = get_cfg(cmd_args.exp_config, cmd_args.exp_cfg_opts)
-    devices = [int(x) for x in cmd_args.devices.split(",")]
 
-    if len(devices) > 1:
-        mp.spawn(
-            entry_train,
-            args=(
-                _cfg,
-                cmd_args.logdir_with_time,
-                cmd_args.resume,
-                cmd_args.model_path,
-                devices,
-                27000 + random.randint(0, 3000),
-            ),
-            nprocs=len(devices),
-            join=True,
-        )
-    else:
-        entry_train(
-            rank=0,
-            cfg=_cfg,
-            logdir_with_time=cmd_args.logdir_with_time,
-            resume=cmd_args.resume,
-            model_path=cmd_args.model_path,
-            devices=devices,
-        )
+    entry_train(
+        cfg=_cfg,
+        logdir_with_time=cmd_args.logdir_with_time,
+        resume=cmd_args.resume,
+        model_path=cmd_args.model_path,
+    )
+
+
