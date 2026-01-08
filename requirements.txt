@@ -9,8 +9,9 @@ transformers==4.57.3
 tokenizers==0.22.1
 datasets==3.6.0
 safetensors
-unsloth==2025.12.4
-unsloth_zoo==2025.12.3
+unsloth==2026.1.2
+unsloth_zoo==2026.1.2
+#flash_attn==2.8.3
 
 # Vision / Image / Robotics
 einops==0.8.1
